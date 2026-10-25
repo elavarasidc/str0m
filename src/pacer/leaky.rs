@@ -180,6 +180,11 @@ impl Pacer for LeakyBucketPacer {
 }
 
 impl LeakyBucketPacer {
+    #[cfg(feature = "_internal_test_exports")]
+    pub(crate) fn configured_rates(&self) -> (Bitrate, Bitrate) {
+        (self.pacing_bitrate, self.padding_bitrate)
+    }
+
     pub fn new(initial_pacing_bitrate: Bitrate) -> Self {
         const DEFAULT_QUEUE_LIMIT: Duration = Duration::from_secs(2);
 

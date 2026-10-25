@@ -23,6 +23,14 @@ pub(crate) enum PacerImpl {
 }
 
 impl PacerImpl {
+    #[cfg(feature = "_internal_test_exports")]
+    pub(crate) fn configured_rates(&self) -> Option<(Bitrate, Bitrate)> {
+        match self {
+            Self::Null(_) => None,
+            Self::LeakyBucket(pacer) => Some(pacer.configured_rates()),
+        }
+    }
+
     pub fn leaky_bucket(rate: Bitrate) -> PacerImpl {
         PacerImpl::LeakyBucket(LeakyBucketPacer::new(rate))
     }

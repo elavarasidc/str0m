@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Event;
-use crate::bwe::BweKind;
+use crate::bwe::{BweKind, TwccPacketReport};
 use crate::bwe_::Bwe;
 use crate::config::KeyingMaterial;
 use crate::config_mod::RtcpReportIntervals;
@@ -95,6 +95,7 @@ pub(crate) struct Session {
     twcc: u64,
     twcc_rx_register: TwccRecvRegister,
     twcc_tx_register: TwccSendRegister,
+    twcc_feedback_events: Option<VecDeque<Vec<TwccPacketReport>>>,
     max_rx_seq_lookup: HashMap<Ssrc, SeqNo>,
 
     bwe: Option<Bwe>,
@@ -202,6 +203,7 @@ impl Session {
             twcc: 0,
             twcc_rx_register: TwccRecvRegister::new(100),
             twcc_tx_register: TwccSendRegister::new(1000),
+            twcc_feedback_events: None,
             max_rx_seq_lookup: HashMap::new(),
             bwe,
             bwe_last_event: None,
@@ -885,8 +887,23 @@ impl Session {
                 trace!("Handle TWCC: {:?}", twcc);
                 let maybe_records = self.twcc_tx_register.apply_report(twcc, now);
 
-                if let (Some(maybe_records), Some(bwe)) = (maybe_records, &mut self.bwe) {
-                    bwe.update(maybe_records, now);
+                if let Some(records) = maybe_records {
+                    if let Some(queue) = &mut self.twcc_feedback_events {
+                        let mut packets = Vec::new();
+                        let records = records.inspect(|r| {
+                            packets.push(TwccPacketReport::from_record(r));
+                        });
+                        if let Some(bwe) = &mut self.bwe {
+                            bwe.update(records, now);
+                        } else {
+                            records.for_each(|_| {});
+                        }
+                        if !packets.is_empty() {
+                            queue.push_back(packets);
+                        }
+                    } else if let Some(bwe) = &mut self.bwe {
+                        bwe.update(records, now);
+                    }
                 }
                 need_configure_pacer = true;
 
@@ -945,6 +962,12 @@ impl Session {
         {
             if let Some(probe) = self.pending_probe.take() {
                 return Some(Event::Probe(probe));
+            }
+        }
+
+        if let Some(queue) = &mut self.twcc_feedback_events {
+            if let Some(packets) = queue.pop_front() {
+                return Some(Event::TwccFeedback(packets));
             }
         }
 
@@ -1201,8 +1224,12 @@ impl Session {
             } else {
                 TwccPacketId::new(twcc_seq)
             };
-            self.twcc_tx_register
-                .register_seq(packet_id, now, payload_size);
+            self.twcc_tx_register.register_seq(
+                packet_id,
+                now,
+                payload_size,
+                media.kind().is_audio(),
+            );
         }
 
         // Update BWE subsystem
@@ -1294,6 +1321,14 @@ impl Session {
         }
     }
 
+    pub fn set_twcc_feedback_events(&mut self, enabled: bool) {
+        if enabled {
+            self.twcc_feedback_events.get_or_insert_with(VecDeque::new);
+        } else {
+            self.twcc_feedback_events = None;
+        }
+    }
+
     pub fn enable_twcc_feedback(&mut self) {
         if !self.enable_twcc_feedback {
             debug!("Enable TWCC feedback");
@@ -1324,6 +1359,28 @@ impl Session {
             bwe.set_desired_bitrate(desired_bitrate);
             self.configure_pacer();
         }
+    }
+
+    #[cfg(feature = "_internal_test_exports")]
+    pub fn pacing_rates(&self) -> Option<(Bitrate, Bitrate)> {
+        self.pacer.configured_rates()
+    }
+
+    #[cfg(feature = "_internal_test_exports")]
+    pub fn set_external_bwe_estimate(
+        &mut self,
+        estimate: Bitrate,
+    ) -> Result<(), crate::bwe::ExternalBweError> {
+        if estimate.is_zero() {
+            return Err(crate::bwe::ExternalBweError::ZeroBitrate);
+        }
+        let bwe = self
+            .bwe
+            .as_mut()
+            .ok_or(crate::bwe::ExternalBweError::Disabled)?;
+        bwe.set_external_estimate(estimate);
+        self.configure_pacer();
+        Ok(())
     }
 
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
@@ -1530,6 +1587,113 @@ mod tests {
     use crate::RtcConfig;
     use crate::io::DATAGRAM_MTU_TARGET;
     use crate::packet::RedEncoder;
+
+    fn packet_feedback(now: Instant) -> TwccPacketReport {
+        TwccPacketReport::from_record(&crate::rtp_::TwccSendRecord::test_new(
+            TwccPacketId::new(1),
+            now,
+            80,
+            now + Duration::from_millis(40),
+            Some(now + Duration::from_millis(20)),
+        ))
+    }
+
+    #[test]
+    fn twcc_feedback_events_are_opt_in_and_disabling_discards_pending_events() {
+        let mut s = Session::new(&RtcConfig::default());
+        assert!(s.twcc_feedback_events.is_none());
+        assert!(!s.enable_twcc_feedback);
+        s.set_twcc_feedback_events(true);
+        assert!(!s.enable_twcc_feedback);
+        assert!(s.bwe.is_none());
+        assert!(s.twcc_feedback_events.as_ref().unwrap().is_empty());
+
+        let packet = packet_feedback(Instant::now());
+        s.twcc_feedback_events
+            .as_mut()
+            .unwrap()
+            .push_back(vec![packet]);
+        s.set_twcc_feedback_events(true);
+        assert_eq!(s.twcc_feedback_events.as_ref().unwrap().len(), 1);
+        s.set_twcc_feedback_events(false);
+        assert!(s.twcc_feedback_events.is_none());
+        assert!(s.poll_event().is_none());
+        s.set_twcc_feedback_events(true);
+        assert!(s.twcc_feedback_events.as_ref().unwrap().is_empty());
+        assert!(s.poll_event().is_none());
+    }
+
+    #[test]
+    fn twcc_feedback_events_precede_pending_native_bwe_estimates() {
+        let rate = Bitrate::kbps(300);
+        let config = RtcConfig::default().enable_bwe(Some(rate));
+        let mut s = Session::new(&config);
+        s.set_twcc_feedback_events(true);
+        let packet = packet_feedback(Instant::now());
+        s.twcc_feedback_events
+            .as_mut()
+            .unwrap()
+            .push_back(vec![packet.clone()]);
+        s.bwe_last_event = Some((rate, true));
+
+        assert!(matches!(
+            s.poll_event(),
+            Some(Event::TwccFeedback(packets)) if packets == [packet]
+        ));
+        assert!(matches!(
+            s.poll_event(),
+            Some(Event::EgressBitrateEstimate(BweKind::Twcc { estimate, can_probe: false }))
+                if estimate == rate
+        ));
+        assert!(s.poll_event().is_none());
+    }
+
+    #[cfg(feature = "_internal_test_exports")]
+    #[test]
+    fn external_bwe_requires_enabled_positive_rate() {
+        use crate::bwe::ExternalBweError;
+        let mut disabled = Session::new(&RtcConfig::default());
+        assert_eq!(
+            disabled.set_external_bwe_estimate(Bitrate::kbps(300)),
+            Err(ExternalBweError::Disabled)
+        );
+        let mut enabled = Session::new(&RtcConfig::default().enable_bwe(Some(Bitrate::kbps(300))));
+        assert_eq!(
+            enabled.set_external_bwe_estimate(Bitrate::ZERO),
+            Err(ExternalBweError::ZeroBitrate)
+        );
+        assert_eq!(
+            enabled.bwe.as_ref().unwrap().last_estimate(),
+            Some(Bitrate::kbps(300))
+        );
+    }
+
+    #[cfg(feature = "_internal_test_exports")]
+    #[test]
+    fn external_bwe_ignores_native_updates_and_reset_preserves_selection() {
+        let now = Instant::now();
+        let mut bwe = Bwe::new(Bitrate::kbps(300));
+        bwe.set_desired_bitrate(Bitrate::mbps(2));
+        bwe.handle_timeout(now, true);
+        bwe.set_external_estimate(Bitrate::kbps(80));
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::kbps(80)));
+        let record = crate::rtp_::TwccSendRecord::test_new(
+            TwccPacketId::new(1),
+            now,
+            1200,
+            now + Duration::from_millis(400),
+            Some(now + Duration::from_millis(300)),
+        );
+        bwe.update([&record].into_iter(), now + Duration::from_millis(400));
+        bwe.handle_timeout(now + Duration::from_secs(1), true);
+        assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(80)));
+        assert!(bwe.poll_estimate().is_none());
+        bwe.reset(Bitrate::kbps(90));
+        bwe.handle_timeout(now + Duration::from_secs(2), true);
+        assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(90)));
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::kbps(90)));
+        assert!(!bwe.is_overusing());
+    }
 
     #[test]
     fn session_mtu_matches_config() {

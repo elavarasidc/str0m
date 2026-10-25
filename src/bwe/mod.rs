@@ -59,6 +59,7 @@ pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
     desired_bitrate: Bitrate,
     smoother: EstimateSmoother,
+    external_pending: Option<Bitrate>,
 }
 
 impl Bwe {
@@ -68,12 +69,17 @@ impl Bwe {
             bwe: send_side_bwe,
             desired_bitrate: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
+            external_pending: None,
         }
     }
 
     pub fn handle_timeout(&mut self, now: Instant, do_probe: bool) -> Option<ProbeClusterConfig> {
         let result = self.bwe.handle_timeout(self.desired_bitrate, do_probe, now);
-        if let Some(estimate) = self.bwe.last_estimate() {
+        if let Some(estimate) = self
+            .bwe
+            .last_estimate()
+            .filter(|_| self.bwe.external_estimate.is_none())
+        {
             self.smoother.record(now, estimate);
         }
         result
@@ -89,6 +95,18 @@ impl Bwe {
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        if self.bwe.external_estimate.is_some() {
+            self.external_pending = Some(init_bitrate);
+        }
+    }
+
+    #[cfg(feature = "_internal_test_exports")]
+    pub fn set_external_estimate(&mut self, estimate: Bitrate) {
+        self.bwe.external_estimate = Some(estimate);
+        self.bwe.last_updated_estimate = None;
+        self.bwe.propagate_estimate();
+        self.smoother = EstimateSmoother::new();
+        self.external_pending = Some(estimate);
     }
 
     pub fn update<'t>(
@@ -100,7 +118,11 @@ impl Bwe {
     }
 
     pub fn poll_estimate(&mut self) -> Option<Bitrate> {
-        self.smoother.poll()
+        if self.bwe.external_estimate.is_some() {
+            self.external_pending.take()
+        } else {
+            self.smoother.poll()
+        }
     }
 
     pub fn poll_timeout(&self) -> (Option<Instant>, Reason) {
@@ -128,6 +150,7 @@ impl Bwe {
 }
 
 struct SendSideBandwidthEstimator {
+    external_estimate: Option<Bitrate>,
     delay_controller: DelayController,
     loss_controller: LossController,
     acked_bitrate_estimator: AckedBitrateEstimator,
@@ -148,6 +171,7 @@ impl SendSideBandwidthEstimator {
         loss_controller.set_bandwidth_estimate(initial_bitrate);
 
         Self {
+            external_estimate: None,
             delay_controller: DelayController::new(initial_bitrate),
             loss_controller,
             acked_bitrate_estimator: AckedBitrateEstimator::new(
@@ -168,7 +192,7 @@ impl SendSideBandwidthEstimator {
     /// This is useful for gating behaviors (like padding/probing) that would otherwise
     /// re-excite the system while we're already congested.
     pub fn is_overusing(&self) -> bool {
-        self.delay_controller.is_overusing()
+        self.external_estimate.is_none() && self.delay_controller.is_overusing()
     }
 
     /// Update ALR detector with actual bytes sent.
@@ -197,6 +221,10 @@ impl SendSideBandwidthEstimator {
             if config.is_alr_probe() {
                 self.link_capacity_estimator.update_from_probe(bitrate, now);
             }
+        }
+
+        if self.external_estimate.is_some() {
+            return;
         }
 
         let mut acked_packets = vec![];
@@ -277,7 +305,10 @@ impl SendSideBandwidthEstimator {
     }
 
     pub fn poll_timeout(&self) -> (Option<Instant>, Reason) {
-        let delay_timeout = Some(self.delay_controller.poll_timeout());
+        let delay_timeout = self
+            .external_estimate
+            .is_none()
+            .then(|| self.delay_controller.poll_timeout());
         let probe_timeout = Some(self.probe_control.poll_timeout());
         let probe_estimator_timeout = Some(self.probe_estimator.poll_timeout());
         (delay_timeout, Reason::BweDelayControl)
@@ -292,8 +323,10 @@ impl SendSideBandwidthEstimator {
         do_probe: bool,
         now: Instant,
     ) -> Option<ProbeClusterConfig> {
-        self.delay_controller
-            .handle_timeout(self.acked_bitrate_estimator.current_estimate(), now);
+        if self.external_estimate.is_none() {
+            self.delay_controller
+                .handle_timeout(self.acked_bitrate_estimator.current_estimate(), now);
+        }
 
         // Update probe control with desired bitrate.
         self.probe_control.set_desired_bitrate(desired_bitrate);
@@ -356,6 +389,9 @@ impl SendSideBandwidthEstimator {
     }
 
     fn bandwidth_limited_cause(&self) -> BandwidthLimitedCause {
+        if self.external_estimate.is_some() {
+            return BandwidthLimitedCause::DelayBasedLimited;
+        }
         if self.delay_controller.is_overusing() {
             return BandwidthLimitedCause::DelayBasedLimitedDelayIncreased;
         }
@@ -369,6 +405,9 @@ impl SendSideBandwidthEstimator {
 
     /// Get the latest estimate.
     pub fn last_estimate(&self) -> Option<Bitrate> {
+        if let Some(estimate) = self.external_estimate {
+            return Some(estimate);
+        }
         let delay_estimate = self.delay_controller.last_estimate();
 
         let loss_result = self.loss_controller.loss_based_result();
@@ -410,7 +449,11 @@ impl SendSideBandwidthEstimator {
     }
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
+        let external = self.external_estimate.is_some();
         *self = Self::new(init_bitrate);
+        if external {
+            self.external_estimate = Some(init_bitrate);
+        }
     }
 }
 
