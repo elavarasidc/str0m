@@ -1079,6 +1079,8 @@ pub struct TwccSendRecord {
     /// Size in bytes of the payload sent.
     size: u16,
 
+    is_audio: bool,
+
     recv_report: Option<TwccRecvReport>,
 }
 
@@ -1105,6 +1107,10 @@ impl TwccSendRecord {
 
     pub fn size(&self) -> usize {
         self.size as usize
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.is_audio
     }
 
     /// The time indicated by the remote side for when they received the packet.
@@ -1136,6 +1142,7 @@ impl TwccSendRecord {
             packet_id,
             local_send_time,
             size: size as u16,
+            is_audio: false,
             recv_report: Some(TwccRecvReport {
                 local_recv_time,
                 remote_recv_time,
@@ -1168,7 +1175,13 @@ impl TwccSendRegister {
         }
     }
 
-    pub fn register_seq(&mut self, packet_id: TwccPacketId, now: Instant, size: usize) {
+    pub fn register_seq(
+        &mut self,
+        packet_id: TwccPacketId,
+        now: Instant,
+        size: usize,
+        is_audio: bool,
+    ) {
         self.last_registered = packet_id.seq();
         self.queue.push_back(TwccSendRecord {
             packet_id,
@@ -1176,6 +1189,7 @@ impl TwccSendRegister {
             // In practice the max sizes is constrained by the MTU and will max out around 1200
             // bytes, hence this cast is fine.
             size: size as u16,
+            is_audio,
             // The recv report, derived from TWCC feedback later.
             recv_report: None,
         });
@@ -1901,7 +1915,7 @@ mod test {
         let mut now = Instant::now();
 
         for i in 0..50 {
-            reg.register_seq(TwccPacketId::new(i), now, 0);
+            reg.register_seq(TwccPacketId::new(i), now, 0, false);
             now = now + Duration::from_micros(15);
         }
 
@@ -2072,7 +2086,7 @@ mod test {
         let mut reg = TwccSendRegister::new(25);
         let mut now = Instant::now();
         for i in 0..25 {
-            reg.register_seq(TwccPacketId::new(i), now, 0);
+            reg.register_seq(TwccPacketId::new(i), now, 0, false);
             now = now + Duration::from_micros(15);
         }
 
@@ -2113,7 +2127,7 @@ mod test {
         let mut reg = TwccSendRegister::new(25);
         let mut now = Instant::now();
         for i in 0..9 {
-            reg.register_seq(TwccPacketId::new(i), now, 0);
+            reg.register_seq(TwccPacketId::new(i), now, 0, false);
             now = now + Duration::from_millis(15);
         }
 
@@ -2189,15 +2203,142 @@ mod test {
     }
 
     #[test]
+    fn packet_feedback_preserves_metadata_and_reported_loss() {
+        use crate::bwe::TwccPacketReport;
+
+        let now = Instant::now();
+        let mut tx = TwccSendRegister::new(10);
+        let mut rx = TwccRecvRegister::new(10);
+
+        for seq in 1..=4 {
+            let packet_id = if seq == 3 {
+                TwccPacketId::with_cluster(seq, 17)
+            } else {
+                TwccPacketId::new(seq)
+            };
+            tx.register_seq(
+                packet_id,
+                now + Duration::from_millis(seq),
+                80 * seq as usize,
+                seq == 1 || seq == 4,
+            );
+            if seq != 3 {
+                rx.update_seq(seq.into(), now + Duration::from_millis(10 + seq));
+            }
+        }
+
+        let feedback = rx.build_report(10_000).unwrap();
+        let feedback_time = now + Duration::from_millis(50);
+        let packets: Vec<_> = tx
+            .apply_report(feedback.clone(), feedback_time)
+            .unwrap()
+            .map(TwccPacketReport::from_record)
+            .collect();
+
+        assert_eq!(
+            packets.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 4]
+        );
+        for (i, packet) in packets.iter().enumerate() {
+            assert_eq!(packet.send_time, now + Duration::from_millis(i as u64 + 1));
+            assert_eq!(packet.local_recv_time, Some(feedback_time));
+            assert_eq!(packet.size_bytes, 80 * (i + 1));
+            assert_eq!(packet.is_audio, i == 0 || i == 3);
+            assert_eq!(packet.is_probe, i == 2);
+            assert_eq!(packet.rtt, Some(feedback_time - packet.send_time));
+            assert_eq!(packet.remote_recv_time.is_none(), i == 2);
+        }
+        assert_eq!(
+            packets[1].remote_recv_time.unwrap() - packets[0].remote_recv_time.unwrap(),
+            Duration::from_millis(1)
+        );
+        assert_ne!(
+            packets[0].remote_recv_time.unwrap(),
+            now + Duration::from_millis(11)
+        );
+
+        let repeated: Vec<_> = tx
+            .apply_report(feedback, now + Duration::from_millis(60))
+            .unwrap()
+            .map(TwccPacketReport::from_record)
+            .collect();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].seq, 3);
+        assert!(repeated[0].remote_recv_time.is_none());
+        assert!(repeated[0].local_recv_time.is_some());
+
+        rx.update_seq(3.into(), now + Duration::from_millis(70));
+        let recovered: Vec<_> = tx
+            .apply_report(
+                rx.build_report(10_000).unwrap(),
+                now + Duration::from_millis(80),
+            )
+            .unwrap()
+            .map(TwccPacketReport::from_record)
+            .collect();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].seq, 3);
+        assert!(recovered[0].remote_recv_time.is_some());
+        assert!(recovered[0].is_probe);
+    }
+
+    #[test]
+    fn packet_feedback_preserves_extended_sequence_and_excludes_expired_history() {
+        use crate::bwe::TwccPacketReport;
+
+        let now = Instant::now();
+        let mut tx = TwccSendRegister::new(2);
+        let mut rx = TwccRecvRegister::new(10);
+        for seq in 65_534..=65_538 {
+            let time = now + Duration::from_millis(seq - 65_534);
+            tx.register_seq(TwccPacketId::new(seq), time, 100, false);
+            rx.update_seq(seq.into(), time);
+        }
+        let packets: Vec<_> = tx
+            .apply_report(
+                rx.build_report(10_000).unwrap(),
+                now + Duration::from_millis(50),
+            )
+            .unwrap()
+            .map(TwccPacketReport::from_record)
+            .collect();
+        assert_eq!(
+            packets.iter().map(|p| p.seq).collect::<Vec<_>>(),
+            [65_537, 65_538]
+        );
+        assert!(packets.iter().all(|p| p.remote_recv_time.is_some()));
+    }
+
+    #[test]
     fn no_acked_duplicates_when_reordered() {
         let now = Instant::now();
         let mut twcc_gen = TwccRecvRegister::new(1000);
         let mut twcc_handler = TwccSendRegister::new(1000);
 
-        twcc_handler.register_seq(TwccPacketId::new(1), now + Duration::from_millis(1), 0);
-        twcc_handler.register_seq(TwccPacketId::new(2), now + Duration::from_millis(2), 0);
-        twcc_handler.register_seq(TwccPacketId::new(3), now + Duration::from_millis(3), 0);
-        twcc_handler.register_seq(TwccPacketId::new(4), now + Duration::from_millis(4), 0);
+        twcc_handler.register_seq(
+            TwccPacketId::new(1),
+            now + Duration::from_millis(1),
+            0,
+            false,
+        );
+        twcc_handler.register_seq(
+            TwccPacketId::new(2),
+            now + Duration::from_millis(2),
+            0,
+            false,
+        );
+        twcc_handler.register_seq(
+            TwccPacketId::new(3),
+            now + Duration::from_millis(3),
+            0,
+            false,
+        );
+        twcc_handler.register_seq(
+            TwccPacketId::new(4),
+            now + Duration::from_millis(4),
+            0,
+            false,
+        );
 
         {
             let acked_packets = twcc_handler
@@ -2218,9 +2359,24 @@ mod test {
             assert_eq!(acked_packets, [1, 2, 4]);
         }
 
-        twcc_handler.register_seq(TwccPacketId::new(5), now + Duration::from_millis(9), 0);
-        twcc_handler.register_seq(TwccPacketId::new(6), now + Duration::from_millis(10), 0);
-        twcc_handler.register_seq(TwccPacketId::new(7), now + Duration::from_millis(11), 0);
+        twcc_handler.register_seq(
+            TwccPacketId::new(5),
+            now + Duration::from_millis(9),
+            0,
+            false,
+        );
+        twcc_handler.register_seq(
+            TwccPacketId::new(6),
+            now + Duration::from_millis(10),
+            0,
+            false,
+        );
+        twcc_handler.register_seq(
+            TwccPacketId::new(7),
+            now + Duration::from_millis(11),
+            0,
+            false,
+        );
 
         {
             let acked_packets = twcc_handler

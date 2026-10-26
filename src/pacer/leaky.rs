@@ -38,6 +38,9 @@ pub struct LeakyBucketPacer {
     media_debt: DataSize,
     /// The current padding debt.
     padding_debt: DataSize,
+    /// Sub-byte repayments retained until a whole byte can be cleared.
+    media_credit: f64,
+    padding_credit: f64,
     /// The longest the average packet can spend in the queue before we force it to be drained.
     queue_limit: Duration,
     /// The queue states given by last handle_timeout.
@@ -97,6 +100,19 @@ impl Pacer for LeakyBucketPacer {
 
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
+        // A completed probe or rate drop must not carry more than the debt time limit.
+        self.media_debt = self
+            .media_debt
+            .min(self.adjusted_bitrate * MAX_DEBT_IN_TIME);
+        self.padding_debt = self
+            .padding_debt
+            .min(self.padding_bitrate * MAX_DEBT_IN_TIME);
+        if self.media_debt == DataSize::ZERO {
+            self.media_credit = 0.0;
+        }
+        if self.padding_debt == DataSize::ZERO {
+            self.padding_credit = 0.0;
+        }
 
         if let Some(request) = self.maybe_create_padding_request(now) {
             self.next_poll_queue = Some(request.midrid);
@@ -164,6 +180,11 @@ impl Pacer for LeakyBucketPacer {
 }
 
 impl LeakyBucketPacer {
+    #[cfg(feature = "_internal_test_exports")]
+    pub(crate) fn configured_rates(&self) -> (Bitrate, Bitrate) {
+        (self.pacing_bitrate, self.padding_bitrate)
+    }
+
     pub fn new(initial_pacing_bitrate: Bitrate) -> Self {
         const DEFAULT_QUEUE_LIMIT: Duration = Duration::from_secs(2);
 
@@ -176,6 +197,8 @@ impl LeakyBucketPacer {
             next_poll_time: None,
             media_debt: DataSize::ZERO,
             padding_debt: DataSize::ZERO,
+            media_credit: 0.0,
+            padding_credit: 0.0,
             queue_limit: DEFAULT_QUEUE_LIMIT,
             queue_states: vec![],
             next_poll_queue: None,
@@ -237,14 +260,32 @@ impl LeakyBucketPacer {
     }
 
     fn clear_debt(&mut self, elapsed: Duration) {
-        self.media_debt = self
-            .media_debt
-            .saturating_sub(self.adjusted_bitrate * elapsed);
-        self.padding_debt = self
-            .padding_debt
-            .saturating_sub(self.padding_bitrate * elapsed);
+        Self::repay_debt(
+            &mut self.media_debt,
+            &mut self.media_credit,
+            self.adjusted_bitrate,
+            elapsed,
+        );
+        Self::repay_debt(
+            &mut self.padding_debt,
+            &mut self.padding_credit,
+            self.padding_bitrate,
+            elapsed,
+        );
         log_pacer_media_debt!(self.media_debt.as_bytes_usize());
         log_pacer_padding_debt!(self.padding_debt.as_bytes_usize());
+    }
+
+    fn repay_debt(debt: &mut DataSize, credit: &mut f64, rate: Bitrate, elapsed: Duration) {
+        let available = *credit + rate.as_f64() * elapsed.as_secs_f64() / 8.0;
+        let whole_bytes = available.floor();
+        *debt = debt.saturating_sub(DataSize::bytes(whole_bytes as i64));
+        // Idle time must not bank credit for a later burst.
+        *credit = if *debt == DataSize::ZERO {
+            0.0
+        } else {
+            available - whole_bytes
+        };
     }
 
     fn next_poll(&self, now: Instant) -> Option<((Instant, PacerReason), Option<&QueueState>)> {
@@ -486,6 +527,136 @@ mod test {
     use crate::rtp_::{DataSize, Mid, RtpHeader};
     use queue::{PacketKind, Queue, QueuedPacket};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn debt_repayment_preserves_fractional_bytes_across_short_timeouts() {
+        for (bps, repaid) in [(1000, 100), (6000, 600), (11000, 1100)] {
+            let make_pacer = || {
+                let mut pacer = LeakyBucketPacer::new(Bitrate::bps(bps));
+                pacer.adjusted_bitrate = Bitrate::bps(bps);
+                pacer.padding_bitrate = Bitrate::bps(bps);
+                pacer.media_debt = DataSize::bytes(2000);
+                pacer.padding_debt = DataSize::bytes(2000);
+                pacer
+            };
+            let mut fine = make_pacer();
+            let mut coarse = make_pacer();
+            for _ in 0..800 {
+                fine.clear_debt(Duration::from_millis(1));
+            }
+            coarse.clear_debt(Duration::from_millis(800));
+            assert_eq!(fine.media_debt, DataSize::bytes(2000 - repaid));
+            assert_eq!(fine.media_debt, coarse.media_debt);
+            assert_eq!(fine.padding_debt, coarse.padding_debt);
+        }
+    }
+
+    #[test]
+    fn idle_time_does_not_bank_fractional_or_whole_byte_credit() {
+        let mut pacer = LeakyBucketPacer::new(Bitrate::bps(1000));
+        pacer.adjusted_bitrate = Bitrate::bps(1000);
+        pacer.padding_bitrate = Bitrate::bps(1000);
+        pacer.media_debt = DataSize::bytes(1);
+        pacer.padding_debt = DataSize::bytes(1);
+        pacer.clear_debt(Duration::from_millis(100));
+        assert_eq!(pacer.media_credit, 0.0);
+        assert_eq!(pacer.padding_credit, 0.0);
+        pacer.media_debt = DataSize::bytes(1);
+        pacer.padding_debt = DataSize::bytes(1);
+        pacer.clear_debt(Duration::from_millis(4));
+        assert_eq!(pacer.media_debt, DataSize::bytes(1));
+        assert_eq!(pacer.padding_debt, DataSize::bytes(1));
+        pacer.clear_debt(Duration::from_millis(4));
+        assert_eq!(pacer.media_debt, DataSize::ZERO);
+        assert_eq!(pacer.padding_debt, DataSize::ZERO);
+    }
+
+    #[test]
+    fn fractional_credit_survives_rate_changes_without_clearing_debt_early() {
+        let mut pacer = LeakyBucketPacer::new(Bitrate::bps(1000));
+        pacer.adjusted_bitrate = Bitrate::bps(1000);
+        pacer.padding_bitrate = Bitrate::ZERO;
+        pacer.media_debt = DataSize::bytes(2);
+        pacer.padding_debt = DataSize::bytes(2);
+        pacer.clear_debt(Duration::from_millis(4));
+        assert_eq!(pacer.media_credit, 0.5);
+        pacer.adjusted_bitrate = Bitrate::bps(2000);
+        pacer.clear_debt(Duration::ZERO);
+        assert_eq!(pacer.media_debt, DataSize::bytes(2));
+        pacer.clear_debt(Duration::from_millis(2));
+        assert_eq!(pacer.media_debt, DataSize::bytes(1));
+        assert_eq!(pacer.padding_debt, DataSize::bytes(2));
+    }
+
+    #[test]
+    fn probe_completion_bounds_carried_debt_at_the_lower_pacing_rate() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::kbps(11));
+        let mut queue = Queue::default();
+        handle_timeout_noisy(&mut pacer, &mut queue, now);
+        pacer.start_probe(ProbeClusterConfig::new(
+            0.into(),
+            Bitrate::mbps(4),
+            ProbeKind::Initial,
+        ));
+        pacer.handle_timeout(now, std::iter::empty());
+        let midrid = MidRid("video".into(), None);
+        for _ in 0..100 {
+            pacer.register_send(now, DataSize::bytes(1200), midrid);
+            if pacer.active_cluster().is_none() {
+                break;
+            }
+        }
+        assert!(pacer.active_cluster().is_none(), "probe must complete");
+        assert!(pacer.media_debt > Bitrate::kbps(11) * MAX_DEBT_IN_TIME);
+
+        let queued_at = now + Duration::from_millis(1);
+        enqueue_packet_noisy(
+            &mut pacer,
+            &mut queue,
+            1,
+            1150,
+            PacketKind::Video,
+            queued_at,
+        );
+        assert_eq!(pacer.adjusted_bitrate, Bitrate::kbps(11));
+        assert!(pacer.media_debt <= pacer.adjusted_bitrate * MAX_DEBT_IN_TIME);
+        assert!(pacer.poll_queue().is_none());
+        for tick in 1..=500 {
+            handle_timeout_noisy(
+                &mut pacer,
+                &mut queue,
+                queued_at + Duration::from_millis(tick),
+            );
+        }
+        assert!(
+            pacer.poll_queue().is_some(),
+            "queued media must be released"
+        );
+    }
+
+    #[test]
+    fn pacing_and_padding_rate_drop_rebounds_existing_debt() {
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(4));
+        pacer.set_padding_rate(Bitrate::mbps(4));
+        pacer.handle_timeout(now, std::iter::empty());
+        pacer.register_send(now, DataSize::bytes(10_000), MidRid("video".into(), None));
+        pacer.set_pacing_rate(Bitrate::kbps(11));
+        pacer.set_padding_rate(Bitrate::bps(1000));
+        pacer.handle_timeout(now, std::iter::empty());
+        assert_eq!(pacer.media_debt, Bitrate::kbps(11) * MAX_DEBT_IN_TIME);
+        assert_eq!(pacer.padding_debt, Bitrate::bps(1000) * MAX_DEBT_IN_TIME);
+        pacer.set_pacing_rate(Bitrate::ZERO);
+        pacer.set_padding_rate(Bitrate::ZERO);
+        pacer.handle_timeout(now, std::iter::empty());
+        assert_eq!(pacer.media_debt, DataSize::ZERO);
+        assert_eq!(pacer.padding_debt, DataSize::ZERO);
+        assert_eq!(pacer.media_credit, 0.0);
+        assert_eq!(pacer.padding_credit, 0.0);
+    }
 
     #[test]
     fn probe_deadline_without_media_or_regular_padding() {

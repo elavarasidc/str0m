@@ -1013,6 +1013,12 @@ pub enum Event {
     /// A new estimate from the bandwidth estimation subsystem.
     EgressBitrateEstimate(BweKind),
 
+    /// Per-packet transport feedback, before any pending aggregate BWE estimate.
+    ///
+    /// Opt in with [`bwe::Bwe::set_twcc_feedback_events`]. This is observation only and does not
+    /// select an external estimator or change sender control.
+    TwccFeedback(Vec<bwe::TwccPacketReport>),
+
     // =================== RTP related events ===================
 
     /// Incoming keyframe request for media that we are sending to the remote peer.
@@ -1570,6 +1576,7 @@ impl Rtc {
                 | Event::PeerStats(_)
                 | Event::ChannelBufferedAmountLow(_)
                 | Event::EgressBitrateEstimate(_)
+                | Event::TwccFeedback(_)
                 | Event::KeyframeRequest(_) => {
                     trace!("{:?}", e)
                 }
